@@ -4,7 +4,7 @@ This repository contains the C++ (Arduino) firmware and hardware specifications 
 
 ## Wiring 
 
-### 1. OLED Display (I2C)
+### 1. OLED Display (SSD1306 - I2C)
 * **VCC** ➔ **3.3V** pin
 * **GND** ➔ **GND** pin
 * **SDA** ➔ **GPIO 21**
@@ -16,7 +16,7 @@ This repository contains the C++ (Arduino) firmware and hardware specifications 
 * **SDA** ➔ **GPIO 21** *(Shared with OLED)*
 * **SCL** ➔ **GPIO 22** *(Shared with OLED)*
 
-### 3. Soil Moisture Sensor (Analogue)
+### 3. Soil Moisture Sensor (Capacitive V2.0)
 * **VCC** ➔ **3.3V** pin
 * **GND** ➔ **GND** pin
 * **AOUT** ➔ **GPIO 34**
