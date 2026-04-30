@@ -8,6 +8,7 @@
 #include <HTTPClient.h>
 #include <ESPmDNS.h>
 #include <ArduinoJson.h>
+#include "esp_sleep.h"
 
 // ---------- Wi-Fi config ----------
 const char* WIFI_SSID_1 = "Nothing Phone(3)_1513";
@@ -21,9 +22,13 @@ const uint16_t SERVER_PORT = 8080;
 struct ServerOverride { const char* ssid; const char* ip; };
 const ServerOverride SERVER_OVERRIDES[] = {
   { "Nothing Phone(3)_1513", "10.117.201.144" },
-  { "moaiwlan",              "10.3.119.21"     },
+  { "moaiwlan",                "10.3.119.21"     },
 };
 const int SERVER_OVERRIDES_COUNT = sizeof(SERVER_OVERRIDES) / sizeof(SERVER_OVERRIDES[0]);
+
+// ---------- Sleep / awake timing ----------
+#define SLEEP_SECONDS         600
+#define OLED_DISPLAY_SECONDS   15 
 
 // ---------- Sensor / display setup ----------
 #define SCREEN_WIDTH    128
@@ -40,17 +45,13 @@ Adafruit_TCS34725 tcs = Adafruit_TCS34725(TCS34725_INTEGRATIONTIME_50MS,
 DHT dht(DHT_PIN, DHT_TYPE);
 WiFiMulti wifiMulti;
 
-// ---------- Cycle / sleep ----------
-const uint32_t CYCLE_MS = 10UL * 60UL * 1000UL;  
+// ---------- RTC memory ----------
+RTC_DATA_ATTR uint32_t bootCount = 0;
 
 // ---------- Moruga Yellow thresholds ----------
-// Trinidad Moruga Scorpion Yellow likes 24–29 °C daytime, soil moist but
-// never waterlogged, 6–8 hours of bright light, humidity 60–80 %.
 const int   SOIL_DRY      = 2500;
-const int   SOIL_WET      = 1200;
 const float TEMP_COLD     = 18.0;
 const float TEMP_HOT      = 32.0;
-const float HUMIDITY_LOW  = 50.0;
 const float LUX_LOW       = 200.0;
 
 // ---------- Helpers ----------
@@ -81,67 +82,68 @@ const char* statusFromReadings(int soil, float temp, float lux) {
   return "Plant OK";
 }
 
-void drawOLED(float t, float h, int soil, float lux, const char* status) {
+void drawOLED(uint32_t cycle, float t, float h, int soil, float lux,
+              float bat, const char* status) {
   display.clearDisplay();
   display.setTextSize(1);
   display.setTextColor(SSD1306_WHITE);
 
   display.setCursor(0, 0);
-  display.printf("T:%.1fC  H:%.0f%%", t, h);
+  display.printf("T:%.1fC H:%.0f%% #%lu", t, h, (unsigned long)cycle);
   display.setCursor(0, 11);
   display.printf("Soil:%d Lux:%.0f", soil, lux);
   display.setCursor(0, 22);
-  display.print(status);
+  display.printf("%-12s %.2fV", status, bat);
 
   display.display();
 }
 
-// ---------- Main lifecycle ----------
+void oledOff() {
+  display.ssd1306_command(SSD1306_DISPLAYOFF);
+}
+
+void goToSleep() {
+  Serial.printf("Sleeping for %d s\n", SLEEP_SECONDS);
+  Serial.flush();
+  oledOff();
+  WiFi.disconnect(true);
+  WiFi.mode(WIFI_OFF);
+  esp_sleep_enable_timer_wakeup((uint64_t)SLEEP_SECONDS * 1000000ULL);
+  esp_deep_sleep_start();
+  // execution never reaches here
+}
+
+// ---------- Single-shot main ----------
 void setup() {
   Serial.begin(115200);
-  delay(300);
+  delay(200);
 
+  bootCount++;
+  Serial.printf("\n=== Wake cycle #%u ===\n", bootCount);
+
+  // I2C + ADC
   Wire.begin(21, 22);
   analogReadResolution(12);
 
+  // OLED
   if (!display.begin(SSD1306_SWITCHCAPVCC, OLED_I2C_ADDR)) {
     Serial.println("OLED init failed");
-    while (true) delay(1000);
+    goToSleep();
   }
   display.clearDisplay();
-  display.setCursor(0, 0);
   display.setTextSize(1);
   display.setTextColor(SSD1306_WHITE);
+  display.setCursor(0, 0);
   display.println("RootNet SmartPot");
-  display.println("booting...");
+  display.printf("Cycle #%u\n", bootCount);
   display.display();
-  delay(800);
 
+  // Sensors
   if (!tcs.begin()) Serial.println("TCS34725 not found");
   dht.begin();
+  delay(1500);
 
-  wifiMulti.addAP(WIFI_SSID_1, WIFI_PASS_1);
-  wifiMulti.addAP(WIFI_SSID_2, WIFI_PASS_2);
-
-  Serial.print("Wi-Fi");
-  unsigned long start = millis();
-  while (wifiMulti.run() != WL_CONNECTED && millis() - start < 15000) {
-    Serial.print(".");
-    delay(500);
-  }
-  if (WiFi.status() == WL_CONNECTED) {
-    Serial.println(" connected");
-    Serial.println(WiFi.SSID());
-    Serial.println(WiFi.localIP());
-    Serial.println(WiFi.macAddress());
-    MDNS.begin("smartpot");
-  } else {
-    Serial.println(" no network");
-  }
-}
-
-void loop() {
-  // ----- 1. Read sensors -----
+  // ---- 1. Read sensors ----
   uint16_t r, g, b, c;
   tcs.getRawData(&r, &g, &b, &c);
   float lux = tcs.calculateLux(r, g, b);
@@ -159,14 +161,26 @@ void loop() {
   Serial.printf("T=%.1fC H=%.0f%% Soil=%d Lux=%.0f Bat=%.2fV  -> %s\n",
                 temp, hum, soil, lux, battery, status);
 
-  drawOLED(temp, hum, soil, lux, status);
+  // ---- 2. Update OLED with real readings ----
+  drawOLED(bootCount, temp, hum, soil, lux, battery, status);
 
-  // ----- 2. Send to server -----
-  if (WiFi.status() != WL_CONNECTED) {
-    wifiMulti.run();
+  // ---- 3. Wi-Fi + POST ----
+  wifiMulti.addAP(WIFI_SSID_1, WIFI_PASS_1);
+  wifiMulti.addAP(WIFI_SSID_2, WIFI_PASS_2);
+
+  Serial.print("Wi-Fi");
+  unsigned long start = millis();
+  while (wifiMulti.run() != WL_CONNECTED && millis() - start < 10000) {
+    Serial.print(".");
+    delay(250);
   }
 
   if (WiFi.status() == WL_CONNECTED) {
+    Serial.printf(" connected to %s (%s)\n",
+                  WiFi.SSID().c_str(), WiFi.localIP().toString().c_str());
+    MDNS.begin("smartpot");
+    delay(200);  // give mDNS a moment
+
     String url = resolveServerURL();
     if (url.length() > 0) {
       url += "/readings";
@@ -191,19 +205,25 @@ void loop() {
       http.setTimeout(5000);
 
       int code = http.POST(body);
-      if (code > 0) {
-        Serial.printf("POST %d\n", code);
-      } else {
-        Serial.printf("POST err: %s\n", http.errorToString(code).c_str());
-      }
+      Serial.printf("POST %d\n", code);
       http.end();
     } else {
       Serial.println("Server not resolvable on this network");
     }
   } else {
-    Serial.println("No Wi-Fi, skipping POST");
+    Serial.println(" no network");
   }
 
-  // ----- 3. Wait until next cycle -----
-  delay(CYCLE_MS);
+  // ---- 4. Keep the OLED on for the rest of the awake window ----
+  unsigned long awakeMs = millis();
+  while (millis() - awakeMs < (unsigned long)OLED_DISPLAY_SECONDS * 1000UL) {
+    delay(100);
+  }
+
+  // ---- 5. Sleep ----
+  goToSleep();
+}
+
+void loop() {
+   // never runs
 }
